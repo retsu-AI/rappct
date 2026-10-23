@@ -44,6 +44,7 @@ pub(super) struct LaunchAttributes {
     security_caps: Rc<OwnedSecurityCapabilities>,
     lpac_policy: Option<Box<u32>>,
     handle_list: Vec<HANDLE>,
+    birth_jobs: Option<Box<[HANDLE; 1]>>,
 }
 
 impl LaunchAttributes {
@@ -52,11 +53,30 @@ impl LaunchAttributes {
         lpac: bool,
         handles: &[HANDLE],
     ) -> Result<Self> {
-        let mut attr_list = FAttrList::with_capacity(attribute_count(lpac, handles))?;
+        Self::new_with_job(security_caps, lpac, handles, None)
+    }
+
+    pub(super) fn new_with_job(
+        security_caps: Rc<OwnedSecurityCapabilities>,
+        lpac: bool,
+        handles: &[HANDLE],
+        job: Option<HANDLE>,
+    ) -> Result<Self> {
+        // These buffers must outlive attr_list on every registration error as well.
+        let birth_jobs = job.map(|job| Box::new([job]));
+        let lpac_policy = lpac.then(|| Box::new(PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT));
+        let handle_list = handles.to_vec();
+        let mut attr_list =
+            FAttrList::with_capacity(attribute_count(lpac, handles) + u32::from(job.is_some()))?;
+        if let Some(jobs) = &birth_jobs {
+            attr_list.set_job_list(jobs.as_ref())?;
+        }
+
         attr_list.set_security_capabilities(security_caps.as_ref())?;
 
-        let lpac_policy = apply_lpac_policy(&mut attr_list, lpac)?;
-        let handle_list = handles.to_vec();
+        if let Some(policy) = &lpac_policy {
+            attr_list.set_all_app_packages_policy(policy.as_ref())?;
+        }
         if !handle_list.is_empty() {
             attr_list.set_handle_list(&handle_list)?;
         }
@@ -66,6 +86,7 @@ impl LaunchAttributes {
             security_caps,
             lpac_policy,
             handle_list,
+            birth_jobs,
         })
     }
 
@@ -75,7 +96,12 @@ impl LaunchAttributes {
     }
 
     fn keep_alive(&self) {
-        let _ = (&self.security_caps, &self.lpac_policy, &self.handle_list);
+        let _ = (
+            &self.security_caps,
+            &self.lpac_policy,
+            &self.handle_list,
+            &self.birth_jobs,
+        );
     }
 }
 
@@ -127,14 +153,4 @@ fn attribute_count(lpac: bool, handles: &[HANDLE]) -> u32 {
         count += 1;
     }
     count
-}
-
-fn apply_lpac_policy(attr_list: &mut FAttrList, lpac: bool) -> Result<Option<Box<u32>>> {
-    if !lpac {
-        return Ok(None);
-    }
-
-    let policy = Box::new(PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT);
-    attr_list.set_all_app_packages_policy(policy.as_ref())?;
-    Ok(Some(policy))
 }

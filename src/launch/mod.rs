@@ -58,6 +58,8 @@ pub struct LaunchOptions {
     pub exe: std::path::PathBuf,
     pub cmdline: Option<String>,
     pub cwd: Option<std::path::PathBuf>,
+    /// Explicit desktop or window-station\\desktop name for the child.
+    pub desktop: Option<std::ffi::OsString>,
     pub env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
     pub stdio: StdioConfig,
     pub suspended: bool,
@@ -76,6 +78,7 @@ pub struct LaunchOptions {
 #[doc(hidden)]
 pub struct LaunchExtra {
     handle_list: Vec<Arc<FHandle>>,
+    primary_token: Option<Arc<FHandle>>,
     stdio: StdioOverrides,
 }
 
@@ -100,6 +103,7 @@ impl Default for LaunchOptions {
         Self {
             exe,
             cmdline: None,
+            desktop: None,
             cwd,
             env: None,
             stdio: StdioConfig::Inherit,
@@ -113,6 +117,29 @@ impl Default for LaunchOptions {
 }
 
 impl LaunchOptions {
+    /// Launch as this primary token, cloned with minimal rights and never inherited.
+    /// Requires a kill-on-close job, no startup timeout, and explicit child resume.
+    #[cfg(windows)]
+    pub fn try_with_primary_token(mut self, token: BorrowedHandle<'_>) -> Result<Self> {
+        if !self
+            .join_job
+            .as_ref()
+            .is_some_and(|job| job.kill_on_job_close)
+        {
+            return Err(crate::AcError::Win32(
+                "explicit token requires kill-on-close job".into(),
+            ));
+        }
+        if self.startup_timeout.is_some() {
+            return Err(crate::AcError::Win32(
+                "explicit token requires no startup timeout".into(),
+            ));
+        }
+        self.extra.primary_token = Some(Arc::new(handles::duplicate_primary_token(token)?));
+        self.suspended = true;
+        Ok(self)
+    }
+
     /// Duplicate additional inheritable handles for the child.
     ///
     /// # Panics

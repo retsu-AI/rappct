@@ -68,6 +68,54 @@ impl Handle {
     }
 }
 
+pub(crate) fn duplicate_primary_token(token: BorrowedHandle<'_>) -> Result<Handle> {
+    use windows::Win32::Security::{
+        GetTokenInformation, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_TYPE,
+        TokenPrimary, TokenType,
+    };
+    let raw = HANDLE(token.as_raw_handle());
+    let mut kind = TOKEN_TYPE::default();
+    let mut returned = 0;
+    // SAFETY: BorrowedHandle is live; the output describes one TOKEN_TYPE.
+    unsafe {
+        GetTokenInformation(
+            raw,
+            TokenType,
+            Some((&mut kind as *mut TOKEN_TYPE).cast()),
+            std::mem::size_of::<TOKEN_TYPE>() as u32,
+            &mut returned,
+        )
+    }
+    .map_err(|error| AcError::Win32(format!("GetTokenInformation(primary type): {error}")))?;
+    if kind != TokenPrimary {
+        return Err(AcError::Win32(
+            "explicit launch token must be primary".into(),
+        ));
+    }
+    let mut duplicate = HANDLE::default();
+    // SAFETY: Token handle remains live; duplicate is immediately owned below.
+    let ok = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            raw,
+            GetCurrentProcess(),
+            &mut duplicate,
+            (TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY).0,
+            0,
+            0,
+        )
+    };
+    if ok == 0 {
+        return Err(AcError::LaunchFailed {
+            stage: "DuplicateHandle(primary token)",
+            hint: "minimal token rights",
+            source: Box::new(std::io::Error::last_os_error()),
+        });
+    }
+    // SAFETY: DuplicateHandle returned one uniquely owned token, closed by CloseHandle.
+    unsafe { Handle::from_raw(duplicate.0) }
+}
+
 pub(crate) fn duplicate_handle(handle: BorrowedHandle<'_>, inherit: bool) -> Result<Handle> {
     let mut duplicated = HANDLE::default();
     // SAFETY: DuplicateHandle expects live handles and returns BOOL. Current process handles

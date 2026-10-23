@@ -19,6 +19,27 @@ impl JobGuard {
     pub fn as_handle(&self) -> HANDLE {
         self.0.as_win32()
     }
+
+    /// Number of processes currently held by this command job.
+    pub fn active_processes(&self) -> Result<u32> {
+        use windows::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+            QueryInformationJobObject,
+        };
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: Owned job and correctly sized output buffer remain live.
+        unsafe {
+            QueryInformationJobObject(
+                Some(self.0.as_win32()),
+                JobObjectBasicAccountingInformation,
+                (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                std::mem::size_of_val(&info) as u32,
+                None,
+            )
+        }
+        .map_err(|error| AcError::Win32(format!("QueryInformationJobObject(active): {error}")))?;
+        Ok(info.ActiveProcesses)
+    }
 }
 
 /// Job object drop-guard that enables kill-on-close by default.
@@ -61,6 +82,13 @@ impl JobObjectDropGuard {
     pub(super) fn kill_on_drop_enabled(&self) -> bool {
         self.kill_on_drop
     }
+}
+
+pub(super) fn create_birth_job_guard(limits: &JobLimits) -> Result<JobGuard> {
+    let handle = create_job_handle()?;
+    apply_extended_limits(&handle, limits)?;
+    apply_cpu_limit(&handle, limits.cpu_rate_percent)?;
+    Ok(JobGuard(handle))
 }
 
 pub(super) fn create_job_guard(

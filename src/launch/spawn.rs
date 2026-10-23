@@ -16,9 +16,9 @@ use core::ffi::c_void;
 use std::cell::{Cell, RefCell};
 use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
-    INFINITE, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOEXW, TerminateProcess,
-    WaitForSingleObject,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessW,
+    EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
+    STARTUPINFOEXW, TerminateProcess, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -27,6 +27,7 @@ struct ProcessInputs {
     exe_w: WideString,
     args_w: Option<Vec<u16>>,
     cwd_w: Option<WideString>,
+    desktop_w: Option<Vec<u16>>,
 }
 
 struct ChildHandles {
@@ -42,15 +43,31 @@ std::thread_local! {
 
 pub(super) fn launch_impl(sec: &SecurityCapabilities, opts: &LaunchOptions) -> Result<LaunchedIo> {
     ensure_lpac_supported(sec)?;
+    let explicit_token = opts.extra.primary_token.as_deref();
+    let birth_job = prepare_birth_job(opts)?;
     let mut inputs = ProcessInputs::from_options(opts)?;
     let mut inherit_list = InheritList::default();
     let mut startup_info = base_startup_info();
+    // ProcessInputs owns this buffer through CreateProcessW.
+    startup_info.StartupInfo.lpDesktop = inputs
+        .desktop_w
+        .as_mut()
+        .map_or(PWSTR::null(), |buffer| PWSTR(buffer.as_mut_ptr()));
 
     let stdio = setup_stdio(opts, &mut startup_info, &mut inherit_list)?;
     duplicate_additional_handles(&opts.extra.handle_list, &mut inherit_list)?;
 
     let security_caps = inflate_security_caps(sec)?;
-    let attributes = LaunchAttributes::new(security_caps, sec.lpac, inherit_list.slice())?;
+    let attributes = if let Some(job) = &birth_job {
+        LaunchAttributes::new_with_job(
+            security_caps,
+            sec.lpac,
+            inherit_list.slice(),
+            Some(job.as_handle()),
+        )?
+    } else {
+        LaunchAttributes::new(security_caps, sec.lpac, inherit_list.slice())?
+    };
     let mut startup_guard = StartUpInfoExGuard::new(startup_info, attributes);
     let mut pi = PROCESS_INFORMATION::default();
     let flags = creation_flags(opts, inputs.env_block.is_some());
@@ -62,11 +79,12 @@ pub(super) fn launch_impl(sec: &SecurityCapabilities, opts: &LaunchOptions) -> R
         inherit_handles,
         flags,
         &mut pi,
+        explicit_token,
     )?;
     drop(inherit_list);
 
     let mut child = process_handles(pi)?;
-    let job_guard = match prepare_child(opts, &child) {
+    let job_guard = match prepare_child(opts, &child, birth_job) {
         Ok(guard) => guard,
         Err(error) => {
             return match terminate_and_reap(&child.process) {
@@ -97,6 +115,31 @@ pub(super) fn make_cmd_args(cmdline: &Option<String>) -> Option<Vec<u16>> {
     })
 }
 
+fn prepare_birth_job(opts: &LaunchOptions) -> Result<Option<job::JobGuard>> {
+    Ok(if opts.extra.primary_token.is_some() {
+        if opts.startup_timeout.is_some() {
+            return Err(AcError::Win32(
+                "explicit token requires no startup timeout".into(),
+            ));
+        }
+        if !opts.suspended
+            || !opts
+                .join_job
+                .as_ref()
+                .is_some_and(|job| job.kill_on_job_close)
+        {
+            return Err(AcError::Win32(
+                "explicit token requires suspended kill-on-close job".into(),
+            ));
+        }
+        Some(job::create_birth_job_guard(
+            opts.join_job.as_ref().expect("validated job"),
+        )?)
+    } else {
+        None
+    })
+}
+
 impl ProcessInputs {
     fn from_options(opts: &LaunchOptions) -> Result<Self> {
         Ok(Self {
@@ -104,6 +147,7 @@ impl ProcessInputs {
             exe_w: WideString::from_os_str(opts.exe.as_os_str()),
             args_w: make_cmd_args(&opts.cmdline),
             cwd_w: build_cwd(opts),
+            desktop_w: desktop_buffer(opts)?,
         })
     }
 
@@ -169,30 +213,51 @@ fn create_child_process(
     inherit_handles: bool,
     flags: PROCESS_CREATION_FLAGS,
     pi: &mut PROCESS_INFORMATION,
+    token: Option<&FHandle>,
 ) -> Result<()> {
     trace_create_process(inputs, inherit_handles, flags);
     let env_ptr = inputs.env_ptr();
     let cwd_ptr = inputs.cwd_ptr();
     let cmd_ptr = inputs.cmd_ptr();
 
-    // SAFETY: CreateProcessW receives buffers that remain alive for the call duration.
-    let create_res = unsafe {
-        CreateProcessW(
-            inputs.exe_w.as_pcwstr(),
-            cmd_ptr,
-            None,
-            None,
-            inherit_handles,
-            flags,
-            env_ptr,
-            cwd_ptr,
-            &info.StartupInfo,
-            pi,
-        )
+    let stage = if token.is_some() {
+        "CreateProcessAsUserW"
+    } else {
+        "CreateProcessW"
     };
-
+    // SAFETY: All token/UTF16/env/attribute owners outlive this synchronous call.
+    let create_res = unsafe {
+        if let Some(token) = token {
+            CreateProcessAsUserW(
+                Some(token.as_win32()),
+                inputs.exe_w.as_pcwstr(),
+                cmd_ptr,
+                None,
+                None,
+                inherit_handles,
+                flags,
+                env_ptr,
+                cwd_ptr,
+                &info.StartupInfo,
+                pi,
+            )
+        } else {
+            CreateProcessW(
+                inputs.exe_w.as_pcwstr(),
+                cmd_ptr,
+                None,
+                None,
+                inherit_handles,
+                flags,
+                env_ptr,
+                cwd_ptr,
+                &info.StartupInfo,
+                pi,
+            )
+        }
+    };
     create_res.map_err(|_| AcError::LaunchFailed {
-        stage: "CreateProcessW",
+        stage,
         hint: "launch",
         source: Box::new(std::io::Error::last_os_error()),
     })
@@ -245,10 +310,17 @@ fn launched_io(
     }
 }
 
-fn prepare_child(opts: &LaunchOptions, child: &ChildHandles) -> Result<Option<job::JobGuard>> {
+fn prepare_child(
+    opts: &LaunchOptions,
+    child: &ChildHandles,
+    birth_job: Option<job::JobGuard>,
+) -> Result<Option<job::JobGuard>> {
     #[cfg(test)]
     fail_post_spawn_setup_for_test(child)?;
-    let guard = job::create_job_guard(opts.join_job.as_ref(), child.process.as_win32())?;
+    let guard = match birth_job {
+        Some(job) => Some(job),
+        None => job::create_job_guard(opts.join_job.as_ref(), child.process.as_win32())?,
+    };
     startup::wait_for_startup(opts, child.process.as_win32())?;
     Ok(guard)
 }
@@ -357,3 +429,62 @@ fn trace_create_process(
     _flags: PROCESS_CREATION_FLAGS,
 ) {
 }
+
+fn desktop_buffer(opts: &LaunchOptions) -> Result<Option<Vec<u16>>> {
+    use std::os::windows::ffi::OsStrExt;
+    opts.desktop
+        .as_ref()
+        .map(|desktop| {
+            let mut buffer: Vec<u16> = desktop.encode_wide().collect();
+            if buffer.contains(&0) {
+                return Err(AcError::Win32("desktop name contains interior NUL".into()));
+            }
+            buffer.push(0);
+            Ok(buffer)
+        })
+        .transpose()
+}
+
+#[cfg(test)]
+mod desktop_tests {
+    use super::*;
+
+    #[test]
+    fn absent_desktop_preserves_null_default() {
+        assert!(
+            ProcessInputs::from_options(&LaunchOptions::default())
+                .unwrap()
+                .desktop_w
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn named_desktop_retains_unicode_spaces_and_terminator() {
+        let options = LaunchOptions {
+            desktop: Some("QQ station\\任务 desktop".into()),
+            ..Default::default()
+        };
+        let inputs = ProcessInputs::from_options(&options).unwrap();
+        let expected: Vec<u16> = "QQ station\\任务 desktop"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        assert_eq!(inputs.desktop_w.as_ref().unwrap(), &expected);
+    }
+
+    #[test]
+    fn interior_nul_is_refused_before_process_creation() {
+        let options = LaunchOptions {
+            desktop: Some("QQ\0wrong".into()),
+            ..Default::default()
+        };
+        assert!(
+            matches!(ProcessInputs::from_options(&options), Err(AcError::Win32(message)) if message == "desktop name contains interior NUL")
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "broker_tests.rs"]
+mod broker_tests;

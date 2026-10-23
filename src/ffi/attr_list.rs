@@ -76,6 +76,24 @@ impl AttrList {
         }
     }
 
+    /// Attach the sole owned command job; caller retains the array through attribute destruction.
+    pub(crate) fn set_job_list(&mut self, jobs: &[HANDLE]) -> Result<()> {
+        use windows::Win32::System::Threading::PROC_THREAD_ATTRIBUTE_JOB_LIST;
+        // SAFETY: Retained slice and live owned job outlive the attribute list.
+        unsafe {
+            UpdateProcThreadAttribute(
+                self.ptr,
+                0,
+                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                Some(jobs.as_ptr().cast()),
+                std::mem::size_of_val(jobs),
+                None,
+                None,
+            )
+        }
+        .map_err(|error| AcError::Win32(format!("UpdateProcThreadAttribute(JobList): {error}")))
+    }
+
     /// Attach a handle inheritance list.
     /// The slice must remain valid until CreateProcessW returns.
     pub(crate) fn set_handle_list(&mut self, handles: &[HANDLE]) -> Result<()> {
