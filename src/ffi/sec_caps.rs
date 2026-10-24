@@ -29,7 +29,11 @@ impl OwnedSecurityCapabilities {
         let caps = caps_vec.into_boxed_slice();
         let sc = SECURITY_CAPABILITIES {
             AppContainerSid: app_sid.as_psid(),
-            Capabilities: caps.as_ptr() as *mut _,
+            Capabilities: if caps.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                caps.as_ptr() as *mut _
+            },
             CapabilityCount: caps.len() as u32,
             Reserved: 0,
         };
