@@ -76,6 +76,16 @@ mod tests {
     use windows::core::PCWSTR;
 
     #[test]
+    fn empty_capabilities_use_a_null_pointer() {
+        let package = OwnedSid::from_sddl("S-1-15-2-1").unwrap();
+        let capabilities = OwnedSecurityCapabilities::new(package, std::iter::empty());
+        assert_eq!(capabilities.sc.CapabilityCount, 0);
+        assert!(capabilities.sc.Capabilities.is_null());
+        assert!(!capabilities.sc.AppContainerSid.0.is_null());
+        assert_eq!(capabilities.sc.Reserved, 0);
+    }
+
+    #[test]
     fn build_security_capabilities() {
         // SAFETY: SDDL strings are valid; resulting PSIDs are converted into owned SIDs.
         unsafe {
